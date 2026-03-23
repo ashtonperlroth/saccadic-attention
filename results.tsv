@@ -1,0 +1,13 @@
+experiment_id	passkey_accuracy	fixation_distance	num_saccades	window_size	block_size	lr	status	description
+0	0.0000	1565.45	5	128	32	1e-4	baseline	baseline run with default config
+1	0.0000	1383.06	5	128	32	1e-4	discard	supervised warmup steps=200 weight=0.5 (default config)
+2	0.1650	684.63	5	128	32	5e-4	keep	lr=5e-4 warmup_steps=400 warmup_weight=1.0 anneal=500
+3	0.0300	421.05	5	128	32	1e-3	discard	lr=1e-3 warmup_steps=600 (lr too high, accuracy dropped)
+4	0.1250	249.36	5	128	32	5e-4	discard	warmup_steps=600 batch_size=8 (distance great but accuracy dropped)
+5	0.4250	189.85	5	128	32	5e-4	keep	warmup_steps=600 warmup_weight=1.5 (big jump!)
+6	0.0000	880.51	5	128	32	5e-4	discard	warmup_steps=800 warmup_weight=2.0 (overshot, destabilized)
+7	0.3350	249.77	8	128	32	5e-4	discard	num_saccades=8 (slower training, fewer steps)
+8	0.0100	531.03	5	128	16	5e-4	discard	block_size=16 (harder to train, worse)
+9	0.1250	557.98	3	64	32	5e-4	discard	num_saccades=3 window=64 (too few saccades, too little context)
+10	0.4550	306.98	5	128	32	5e-4	keep	time_budget=900s (15 min, more training steps)
+11	0.5100	947.94	5	128	32	5e-4	keep	time_budget=1200s train_samples=4000

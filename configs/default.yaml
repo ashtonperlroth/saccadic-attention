@@ -1,56 +1,68 @@
-# Saccadic Attention — Default Configuration
-
-# Model
 model:
   name: gpt2
-  saccadic_layers: [6, 7, 8, 9, 10, 11]  # layers where attention is replaced
-
-# Saccadic attention
+  saccadic_layers:
+  - 6
+  - 7
+  - 8
+  - 9
+  - 10
+  - 11
 saccadic:
   num_saccades: 5
-  window_size: 128        # k: foveal window size in tokens
-  block_size: 32           # B: peripheral encoder block size
-  mask_fixated: false      # mask previously fixated regions
-
-# Gumbel-softmax
+  window_size: 128
+  block_size: 32
+  mask_fixated: false
 gumbel:
   temp_start: 1.0
   temp_end: 0.1
-  anneal_steps: 10000      # linear anneal over this many steps
-
-# Training
+  anneal_steps: 500
 training:
   batch_size: 4
   max_steps: 50000
-  lr: 1.0e-4
+  lr: 0.0005
   weight_decay: 0.01
   warmup_steps: 1000
   schedule: cosine
   gradient_clip: 1.0
-  entropy_bonus: 0.01      # encourage fixation diversity
+  entropy_bonus: 0.01
+  supervised_warmup_steps: 600
+  supervised_warmup_weight: 1.5
   checkpoint_every: 5000
   log_every: 100
   eval_every: 1000
-
-# Data
 data:
-  task: passkey             # passkey | pg19
-  context_lengths: [2048, 4096, 8192, 16384, 32768]
+  task: passkey
+  context_lengths:
+  - 2048
+  - 4096
+  - 8192
+  - 16384
+  - 32768
   train_context_length: 2048
   num_train_samples: 10000
   num_eval_samples: 500
-
-# Evaluation
 eval:
-  context_lengths: [2048, 4096, 8192, 16384, 32768]
-
-# Ablations
+  context_lengths:
+  - 2048
+  - 4096
+  - 8192
+  - 16384
+  - 32768
 ablations:
-  num_saccades: [1, 3, 5, 10]
-  window_sizes: [64, 128, 256, 512]
-  controller_types: [learned, random, uniform]
-
-# Logging
+  num_saccades:
+  - 1
+  - 3
+  - 5
+  - 10
+  window_sizes:
+  - 64
+  - 128
+  - 256
+  - 512
+  controller_types:
+  - learned
+  - random
+  - uniform
 logging:
   use_wandb: false
   project: saccadic-attention

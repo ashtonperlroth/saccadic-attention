@@ -80,17 +80,36 @@ These are your degrees of freedom in each experiment:
 | `window_size` | 32, 64, 128, 256 |
 | `block_size` | 8, 16, 32, 64 |
 | `learning_rate` | 1e-5 to 1e-3 |
-| `gumbel_temp_start` | 0.5–5.0 |
+| `gumbel_temp_start` | 0.5–2.0 |
 | `gumbel_temp_end` | 0.01–1.0 |
-| `anneal_steps` | 100–10000 |
+| `anneal_steps` | 100–1500 (capped to match actual steps per experiment) |
 | `entropy_bonus` | 0.0–0.1 |
-| `saccadic_layers` | any subset of [0–11] |
+| `saccadic_layers` | [6-11], [8-11], [10-11], or [0-11] |
 | `peripheral encoder design` | pooling strategy, normalization, positional encoding |
 | `state initialization` | mean pooling, max pooling, learned, CLS token |
 | `optimizer` | AdamW, Adam, SGD with momentum |
 | `schedule` | cosine, linear, constant, warmup variations |
 | `gradient_clip` | 0.1–10.0 |
-| `batch_size` | 1–8 (limited by memory) |
+| `batch_size` | 1–32 (96GB VRAM available) |
+| `context_length` | 1024, 2048, 4096 (training context; eval is always 4096) |
+| `time_budget` | 480, 900, 1200 seconds |
+| `supervised_warmup_steps` | 0–500 (see below) |
+| `supervised_warmup_weight` | 0.0–1.0 |
+
+### Supervised Warmup (important)
+
+The saccadic controller has a cold-start problem: it doesn't know where to look, so it gets no useful gradient signal, so it never learns where to look. **Supervised warmup** breaks this chicken-and-egg cycle.
+
+When `supervised_warmup_steps > 0` in the config, the training loop adds an auxiliary loss for the first N steps that pushes the controller's fixation logits toward the block containing the known passkey position. The auxiliary loss weight is annealed linearly from `supervised_warmup_weight` to 0 over the warmup period, so the controller learns to find the target on its own afterward.
+
+This is configured in `configs/default.yaml` under the `training` section:
+```yaml
+training:
+  supervised_warmup_steps: 200    # number of steps with auxiliary fixation loss
+  supervised_warmup_weight: 0.5   # initial weight of the auxiliary loss
+```
+
+The supervised warmup loss is computed in `experiment.py`'s `train()` function. It uses the passkey_position from each training example to compute a cross-entropy loss against the controller's fixation logits, encouraging the controller to fixate on the block containing the passkey. This loss is annealed to zero so it doesn't constrain the controller after warmup.
 
 You may also make **architectural changes** to the trainable saccadic components — e.g., add a residual connection in the controller, change the foveal processor's FFN, modify how peripheral blocks are pooled. Be creative.
 

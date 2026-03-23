@@ -25,10 +25,10 @@ from src.gpt2_saccadic import GPT2Saccadic
 # ── Configuration ──────────────────────────────────────────────────────────────
 
 CONFIG_PATH = 'configs/default.yaml'
-WALL_CLOCK_BUDGET_SECONDS = 10 * 60  # 10 minutes total (train + eval)
+WALL_CLOCK_BUDGET_SECONDS = 20 * 60  # 10 minutes total (train + eval)
 EVAL_CONTEXT_LENGTH = 4096
 TRAIN_CONTEXT_LENGTH = 4096
-NUM_TRAIN_SAMPLES = 2000
+NUM_TRAIN_SAMPLES = 4000
 NUM_EVAL_SAMPLES = 200
 EVAL_BATCH_SIZE = 4
 
@@ -63,6 +63,39 @@ def compute_entropy_bonus(fixation_info: dict) -> torch.Tensor:
             total_entropy = total_entropy + entropy.to(total_entropy.device)
             count += 1
     return total_entropy / max(count, 1)
+
+
+def compute_supervised_warmup_loss(
+    fixation_info: dict,
+    passkey_positions: list[int],
+    block_size: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Auxiliary loss pushing fixation logits toward the block containing the passkey.
+
+    Uses cross-entropy between the controller's fixation logits and the target
+    block index derived from the known passkey position. Applied across all
+    saccadic layers and all saccade steps so the controller gets dense signal.
+    """
+    total_loss = torch.tensor(0.0, device=device)
+    count = 0
+
+    # Target block index for each batch element: (batch,)
+    target_blocks = torch.tensor(
+        [pos // block_size for pos in passkey_positions],
+        device=device, dtype=torch.long,
+    )
+
+    for layer_idx, info in fixation_info.items():
+        for logits in info['fixation_logits']:
+            # logits: (batch, num_blocks)
+            num_blocks = logits.shape[1]
+            # Clamp target to valid range (passkey might be in last partial block)
+            clamped_targets = target_blocks.clamp(max=num_blocks - 1)
+            total_loss = total_loss + torch.nn.functional.cross_entropy(logits, clamped_targets)
+            count += 1
+
+    return total_loss / max(count, 1)
 
 
 def collate_fn(batch: list[dict]) -> dict:
@@ -128,6 +161,22 @@ def train(model, config, tokenizer, device, time_budget: float) -> None:
             entropy_coeff = tc.get('entropy_bonus', 0.01)
             loss = lm_loss - entropy_coeff * entropy
 
+            # Supervised warmup: auxiliary loss pushing fixations toward passkey
+            warmup_steps = tc.get('supervised_warmup_steps', 0)
+            warmup_weight_init = tc.get('supervised_warmup_weight', 0.5)
+            warmup_loss_val = 0.0
+            if warmup_steps > 0 and global_step < warmup_steps:
+                # Linear anneal from warmup_weight_init to 0 over warmup_steps
+                warmup_weight = warmup_weight_init * (1.0 - global_step / warmup_steps)
+                warmup_loss = compute_supervised_warmup_loss(
+                    outputs['fixation_info'],
+                    batch['passkey_position'],
+                    sc['block_size'],
+                    device,
+                )
+                loss = loss + warmup_weight * warmup_loss
+                warmup_loss_val = warmup_loss.item()
+
             # Backward
             optimizer.zero_grad()
             loss.backward()
@@ -138,9 +187,10 @@ def train(model, config, tokenizer, device, time_budget: float) -> None:
             global_step += 1
 
             if global_step % 50 == 0:
+                warmup_str = f' | warmup_loss {warmup_loss_val:.3f}' if warmup_steps > 0 and global_step <= warmup_steps else ''
                 log(f'  step {global_step} | loss {loss.item():.4f} | '
                     f'lm_loss {lm_loss.item():.4f} | entropy {entropy.item():.3f} | '
-                    f'temp {temp:.3f} | elapsed {elapsed:.0f}s')
+                    f'temp {temp:.3f} | elapsed {elapsed:.0f}s{warmup_str}')
 
 
 # ── Evaluation (DO NOT MODIFY THIS SECTION) ───────────────────────────────────
