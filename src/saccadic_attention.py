@@ -58,6 +58,22 @@ class SaccadicAttention(nn.Module):
             mask_fixated=mask_fixated,
         )
 
+        # Global peripheral map update: cross-attention from peripheral blocks to foveal output
+        self.map_update_attn = nn.MultiheadAttention(
+            embed_dim=hidden_dim,
+            num_heads=num_heads,
+            batch_first=True,
+        )
+        self.map_update_norm = nn.LayerNorm(hidden_dim)
+        # Confidence gate: learned per-saccade blending weight
+        # Input: saccade step index (scalar) -> blending alpha
+        self.map_update_gate = nn.Sequential(
+            nn.Linear(1, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 1),
+            nn.Sigmoid(),
+        )
+
         # Output projection: broadcast state back to sequence length
         self.output_proj = nn.Linear(hidden_dim, hidden_dim)
         self.output_norm = nn.LayerNorm(hidden_dim)
@@ -66,11 +82,14 @@ class SaccadicAttention(nn.Module):
         self,
         x: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
+        peripheral_source: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict]:
         """
         Args:
             x: (batch, seq_len, hidden_dim) — token embeddings
             attention_mask: (batch, seq_len) — 1 for real tokens, 0 for padding
+            peripheral_source: (batch, seq_len, hidden_dim) — if provided, used to
+                build the peripheral map instead of x (e.g., layer-5 outputs)
 
         Returns:
             output: (batch, seq_len, hidden_dim) — contextualized representations
@@ -79,8 +98,10 @@ class SaccadicAttention(nn.Module):
         batch, seq_len, hidden_dim = x.shape  # (B, N, D)
 
         # Phase 1: Peripheral encoding — O(n)
+        # Use peripheral_source (e.g., layer-5 outputs) if available, else x
+        periph_input = peripheral_source if peripheral_source is not None else x
         # peripheral_map: (batch, num_blocks, D)
-        peripheral_map = self.peripheral_encoder(x, attention_mask=attention_mask)
+        peripheral_map = self.peripheral_encoder(periph_input, attention_mask=attention_mask)
         num_blocks = peripheral_map.shape[1]
 
         # Build block-level attention mask if needed
@@ -107,6 +128,7 @@ class SaccadicAttention(nn.Module):
         fixation_points = []
         fixation_logits_list = []
         fixation_history = []
+        accumulated_context = None  # grows with each saccade
 
         for t in range(self.num_saccades):
             # Decide where to look: controller outputs token-level position
@@ -120,9 +142,24 @@ class SaccadicAttention(nn.Module):
             fixation_logits_list.append(logits)
             fixation_history.append(block_idx)
 
-            # Process at high resolution: foveal attention over window
-            # state: (batch, D) — updated
-            state = self.foveal_processor(x, fixation_point, state)
+            # Process at high resolution: foveal attention over accumulated context
+            # state: (batch, D), accumulated_context: (batch, t*window_size, D)
+            state, accumulated_context = self.foveal_processor(
+                x, fixation_point, state, accumulated_context=accumulated_context,
+            )
+
+            # Global peripheral map update: all blocks attend to accumulated foveal context
+            # This lets the controller make better-informed decisions on subsequent saccades
+            normed_map = self.map_update_norm(peripheral_map)
+            map_delta, _ = self.map_update_attn(
+                normed_map,                    # queries: peripheral blocks
+                accumulated_context,           # keys: all foveal tokens seen so far
+                accumulated_context,           # values
+            )
+            # Confidence-weighted blending: early saccades update less than later ones
+            step_input = torch.tensor([[t / self.num_saccades]], device=x.device, dtype=x.dtype)
+            alpha = self.map_update_gate(step_input)  # (1, 1)
+            peripheral_map = peripheral_map + alpha * map_delta
 
         # Phase 3: Output projection
         # Broadcast updated state back to every token position

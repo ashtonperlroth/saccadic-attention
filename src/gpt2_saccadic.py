@@ -76,11 +76,14 @@ class SaccadicGPT2Block(nn.Module):
         self,
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
+        peripheral_source: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict]:
         """
         Args:
             hidden_states: (batch, seq_len, hidden_dim)
             attention_mask: (batch, seq_len)
+            peripheral_source: (batch, seq_len, hidden_dim) — if provided, used to build
+                the peripheral map instead of hidden_states (e.g., layer-5 outputs)
 
         Returns:
             hidden_states: (batch, seq_len, hidden_dim)
@@ -92,8 +95,13 @@ class SaccadicGPT2Block(nn.Module):
         hidden_states = self.ln_1(hidden_states)
 
         # Saccadic attention (replaces standard self-attention)
+        # Use peripheral_source for building the peripheral map if available
         # attn_output: (batch, seq_len, D), info: dict
-        attn_output, info = self.saccadic_attn(hidden_states, attention_mask=attention_mask)
+        attn_output, info = self.saccadic_attn(
+            hidden_states,
+            attention_mask=attention_mask,
+            peripheral_source=peripheral_source,
+        )
         hidden_states = residual + attn_output
 
         # FFN (standard GPT-2 MLP)
@@ -180,8 +188,12 @@ class GPT2Saccadic(nn.Module):
         batch, seq_len = input_ids.shape
 
         # Embeddings
+        # GPT-2's position embedding table has max 1024 entries.
+        # For longer sequences, clamp position IDs — saccadic attention
+        # handles long-range dependencies, not position embeddings.
+        max_pos = self.gpt2.config.n_positions  # 1024 for GPT-2
         inputs_embeds = self.gpt2.transformer.wte(input_ids)       # (batch, seq_len, D)
-        position_ids = torch.arange(seq_len, device=device).unsqueeze(0)
+        position_ids = torch.arange(seq_len, device=device).clamp(max=max_pos - 1).unsqueeze(0)
         position_embeds = self.gpt2.transformer.wpe(position_ids)  # (1, seq_len, D)
         hidden_states = inputs_embeds + position_embeds            # (batch, seq_len, D)
         hidden_states = self.gpt2.transformer.drop(hidden_states)
@@ -189,18 +201,29 @@ class GPT2Saccadic(nn.Module):
         # Cache position is required by newer transformers for causal mask generation
         cache_position = torch.arange(seq_len, device=device)
 
+        # The last non-saccadic layer's output serves as peripheral source.
+        # For default saccadic_layers=[6..11], this is layer 5's output —
+        # contextualized representations that make much richer peripheral maps.
+        peripheral_source = None
+        first_saccadic = min(self.saccadic_layers)
+
         # Run through all transformer layers
         all_fixation_info = {}
         for layer_idx, block in enumerate(self.gpt2.transformer.h):
             if str(layer_idx) in self.saccadic_blocks:
-                # Use saccadic block
+                # Use saccadic block, passing peripheral_source from pre-saccadic layers
                 hidden_states, info = self.saccadic_blocks[str(layer_idx)](
-                    hidden_states, attention_mask=attention_mask,
+                    hidden_states,
+                    attention_mask=attention_mask,
+                    peripheral_source=peripheral_source,
                 )
                 all_fixation_info[layer_idx] = info
             else:
                 # Use original GPT-2 block (returns tensor directly in newer transformers)
                 hidden_states = block(hidden_states, cache_position=cache_position)
+                # Capture output of the last non-saccadic layer as peripheral source
+                if layer_idx == first_saccadic - 1:
+                    peripheral_source = hidden_states.detach()  # detach to avoid backprop through frozen layers
 
         # Final layer norm
         hidden_states = self.gpt2.transformer.ln_f(hidden_states)  # (batch, seq_len, D)
