@@ -139,19 +139,36 @@ class PeripheralEncoder(nn.Module):
         out = self.norm(self.project(combined))  # (B, nb, 128)
         return out + self.pos_emb(torch.arange(nb, device=x.device))
 
+TOP_K = 16  # number of blocks to process per saccade
+
 class Controller(nn.Module):
     def __init__(self, dim, bs):
         super().__init__()
         self.bs, self.dim = bs, dim
         self.qp = nn.Linear(dim, dim); self.kp = nn.Linear(dim, dim)
-        self.temperature = 1.0
+        self.temperature = 5.0  # start soft, anneal to 0.1
+
     def forward(self, pm, state):
+        # pm: (B, M, D), state: (B, D)
         s = torch.einsum('bd,bmd->bm', self.qp(state), self.kp(pm)) / math.sqrt(self.dim)
+        logits = s  # (B, M) — raw scores for supervised warmup loss
+
         if self.training:
-            sel = F.gumbel_softmax(s, tau=self.temperature, hard=True)
-            idx = torch.einsum('bm,m->b', sel, torch.arange(pm.shape[1], device=s.device, dtype=torch.float))
-        else: idx = s.argmax(-1).float()
-        return (idx * self.bs).long(), s, idx.long()
+            # Soft routing: weights over ALL blocks (fully differentiable)
+            weights = F.softmax(s / self.temperature, dim=-1)  # (B, M)
+            # Top-K for efficiency
+            topk_vals, topk_idx = torch.topk(s, k=min(TOP_K, s.shape[1]), dim=-1)
+            topk_weights = F.softmax(topk_vals / self.temperature, dim=-1)  # (B, K)
+            # Best fixation point for logging
+            best_fp = (topk_idx[:, 0] * self.bs).long()
+        else:
+            # Hard selection at inference
+            topk_idx = s.argmax(dim=-1, keepdim=True)  # (B, 1)
+            topk_weights = torch.ones(s.shape[0], 1, device=s.device)
+            best_fp = (topk_idx[:, 0] * self.bs).long()
+
+        return best_fp, logits, topk_idx, topk_weights
+
 
 class Foveal(nn.Module):
     def __init__(self, dim, nh, ws):
@@ -160,22 +177,27 @@ class Foveal(nn.Module):
         self.attn = nn.MultiheadAttention(dim, nh, batch_first=True)
         self.n1 = nn.LayerNorm(dim); self.n2 = nn.LayerNorm(dim)
         self.ff = nn.Sequential(nn.Linear(dim, dim*4), nn.GELU(), nn.Linear(dim*4, dim))
-    def _ext(self, x, fp):
+
+    def _ext_single(self, x, center):
+        """Extract one window centered at `center` for all batch elements."""
         B, N, D = x.shape; h = self.ws // 2; ws = []
         for i in range(B):
-            c = fp[i].item(); s, e = max(0, c-h), min(N, c+h)
+            c = center[i].item(); s, e = max(0, c-h), min(N, c+h)
             if e-s < self.ws: s = max(0, e-self.ws) if s>0 else 0; e = min(N, s+self.ws)
             w = x[i, s:e]
             if w.shape[0] < self.ws: w = F.pad(w, (0, 0, 0, self.ws-w.shape[0]))
             ws.append(w)
-        return torch.stack(ws)
-    def forward(self, x, fp, state, acc=None):
-        win = self._ext(x, fp)
+        return torch.stack(ws)  # (B, ws, D)
+
+    def forward_single(self, x, center, state, acc=None):
+        """Process one window. Returns (state_update, window)."""
+        win = self._ext_single(x, center)  # (B, ws, D)
         ctx = torch.cat([state.unsqueeze(1)] + ([acc, win] if acc is not None else [win]), 1)
         out, _ = self.attn(self.n1(ctx), self.n1(ctx), self.n1(ctx))
-        ctx = ctx + out; cl = ctx[:, 0]
+        ctx = ctx + out
+        cl = ctx[:, 0]
         cl = cl + self.ff(self.n2(cl))
-        return cl, (torch.cat([acc, win], 1) if acc is not None else win)
+        return cl, win  # state update and raw window
 
 class SaccadicLayer(nn.Module):
     """Split-path saccadic layer.
@@ -213,9 +235,28 @@ class SaccadicLayer(nn.Module):
         st = pm.mean(1)
         fps, fls = [], []; ac = None
         for t in range(self.ns):
-            fp, lg, _ = self.ctrl(pm, st); fps.append(fp); fls.append(lg)
-            # Foveal processes projected (128-dim) tokens
-            st, ac = self.fov(h, fp, st, ac)
+            fp, lg, topk_idx, topk_w = self.ctrl(pm, st)
+            fps.append(fp); fls.append(lg)
+
+            if self.training:
+                # Soft routing: process top-K blocks, weight outputs
+                K = topk_idx.shape[1]
+                weighted_state = torch.zeros_like(st)
+                best_win = None
+                for k in range(K):
+                    centers = (topk_idx[:, k] * self.ctrl.bs).long()
+                    s_k, win_k = self.fov.forward_single(h, centers, st, ac)
+                    weighted_state = weighted_state + topk_w[:, k].unsqueeze(-1) * s_k
+                    if k == 0:
+                        best_win = win_k  # accumulate the highest-scored window
+                st = weighted_state
+                ac = torch.cat([ac, best_win], 1) if ac is not None else best_win
+            else:
+                # Hard selection at inference — single window
+                s_new, win_new = self.fov.forward_single(h, fp, st, ac)
+                st = s_new
+                ac = torch.cat([ac, win_new], 1) if ac is not None else win_new
+
             d, _ = self.ma(self.mn(pm), ac, ac)
             a = self.mg(torch.tensor([[t/self.ns]], device=x_sacc.device, dtype=x_sacc.dtype))
             pm = pm + a * d
@@ -340,9 +381,10 @@ def run_diagnostics(model, device, tokenizer):
 
 # ── Training ──────────────────────────────────────────────────────────────────
 
-def gumbel_temp(step):
+def routing_temp(step):
+    """Anneal from 5.0 (soft) to 0.1 (hard) over training."""
     p = min(step / max(GUMBEL_ANNEAL_STEPS, 1), 1.0)
-    return 1.0 + (0.1 - 1.0) * p
+    return 5.0 + (0.1 - 5.0) * p
 
 def quick_val(model, val_loader, device):
     model.eval(); cor = tot = 0
@@ -394,7 +436,7 @@ def train_and_eval(model, tokenizer, device):
                     log(f'  PLATEAU at step {step}, best={best_val:.4f}'); break
 
             ids = b['input_ids'].to(device); dl = b['digit_labels'].to(device)
-            model.set_gumbel_temperature(gumbel_temp(step))
+            model.set_gumbel_temperature(routing_temp(step))
             out = model(ids, labels=dl); loss = out['loss']
 
             # Entropy bonus
