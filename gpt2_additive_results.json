@@ -1,0 +1,26 @@
+[
+  {
+    "n_hops": 3, "n_saccades": 3,
+    "accuracy": 0.37, "avg_clue_distance": 152.95,
+    "steps": 3100, "time_s": 569.0,
+    "converge_reason": "plateau (500 steps)",
+    "architecture": "additive",
+    "trainable_params": 60641314
+  },
+  {
+    "n_hops": 3, "n_saccades": 4,
+    "accuracy": 0.015, "avg_clue_distance": 215.66,
+    "steps": 650, "time_s": 127.0,
+    "converge_reason": "plateau (500 steps)",
+    "architecture": "additive",
+    "trainable_params": 60641314
+  },
+  {
+    "n_hops": 4, "n_saccades": 4,
+    "accuracy": 0.0, "avg_clue_distance": 128.36,
+    "steps": 800, "time_s": 156.0,
+    "converge_reason": "plateau (500 steps)",
+    "architecture": "additive",
+    "trainable_params": 60649004
+  }
+]
