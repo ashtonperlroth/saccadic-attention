@@ -96,24 +96,47 @@ def collate(batch):
 # ── Saccadic Components (identical to tiny model) ────────────────────────────
 
 class PeripheralEncoder(nn.Module):
-    def __init__(self, dim, bs):
+    """Operates on FULL Qwen dim (1536) for statistics, uses lightweight conv.
+
+    Conv projects 1536→256 (cheap), then combines with std/max stats.
+    Each stat is projected independently 1536→256, then concat → 128.
+    Total: ~1.5M params instead of ~18M.
+    """
+    def __init__(self, base_dim, sacc_dim, bs):
         super().__init__()
         self.bs = bs
-        self.conv = nn.Conv1d(dim, dim, kernel_size=bs, stride=bs)
-        self.project = nn.Linear(dim * 3, dim)
-        self.norm = nn.LayerNorm(dim)
-        self.pos_emb = nn.Embedding(16384, dim)
+        mid = 256  # intermediate projection dim
+        # Lightweight conv: project down THEN convolve (much cheaper)
+        self.conv_proj = nn.Linear(base_dim, mid)
+        self.conv = nn.Conv1d(mid, mid, kernel_size=bs, stride=bs)
+        # Independent projections for std and max (1536→256 each)
+        self.std_proj = nn.Linear(base_dim, mid)
+        self.max_proj = nn.Linear(base_dim, mid)
+        # Combine 3×256 → sacc_dim
+        self.project = nn.Linear(mid * 3, sacc_dim)
+        self.norm = nn.LayerNorm(sacc_dim)
+        self.pos_emb = nn.Embedding(16384, sacc_dim)
+
     def forward(self, x):
+        # x: (B, N, base_dim=1536) — full Qwen hidden states
         B, N, D = x.shape
         pad = (self.bs - N % self.bs) % self.bs
         if pad: x = F.pad(x, (0, 0, 0, pad))
         nb = x.shape[1] // self.bs
-        conv_out = self.conv(x.transpose(1, 2)).transpose(1, 2)
-        blocks = x.reshape(B, nb, self.bs, D)
-        std_pool = blocks.std(dim=2)
-        max_pool = blocks.max(dim=2).values
-        combined = torch.cat([conv_out, std_pool, max_pool], dim=-1)
-        out = self.norm(self.project(combined))
+
+        # Conv path: project 1536→256 then convolve
+        x_mid = self.conv_proj(x)  # (B, N, 256)
+        conv_out = self.conv(x_mid.transpose(1, 2)).transpose(1, 2)  # (B, nb, 256)
+
+        # Stats at full dim, then project
+        blocks = x.reshape(B, nb, self.bs, D)  # (B, nb, bs, 1536)
+        std_full = blocks.std(dim=2)       # (B, nb, 1536)
+        max_full = blocks.max(dim=2).values  # (B, nb, 1536)
+        std_out = self.std_proj(std_full)  # (B, nb, 256)
+        max_out = self.max_proj(max_full)  # (B, nb, 256)
+
+        combined = torch.cat([conv_out, std_out, max_out], dim=-1)  # (B, nb, 768)
+        out = self.norm(self.project(combined))  # (B, nb, 128)
         return out + self.pos_emb(torch.arange(nb, device=x.device))
 
 class Controller(nn.Module):
@@ -155,30 +178,50 @@ class Foveal(nn.Module):
         return cl, (torch.cat([acc, win], 1) if acc is not None else win)
 
 class SaccadicLayer(nn.Module):
-    def __init__(self, dim, nh, bs, ws, ns):
+    """Split-path saccadic layer.
+
+    Peripheral encoder runs on full-dim hidden states (1536).
+    Foveal processor runs on projected tokens (128-dim).
+    """
+    def __init__(self, base_dim, sacc_dim, nh, bs, ws, ns):
         super().__init__()
         self.ns = ns
-        self.pe = PeripheralEncoder(dim, bs); self.ctrl = Controller(dim, bs)
-        self.fov = Foveal(dim, nh, ws)
-        self.ma = nn.MultiheadAttention(dim, nh, batch_first=True)
-        self.mn = nn.LayerNorm(dim)
-        self.mg = nn.Sequential(nn.Linear(1, dim), nn.GELU(), nn.Linear(dim, 1), nn.Sigmoid())
-        self.op = nn.Linear(dim, dim); self.on = nn.LayerNorm(dim)
-        self.ln1 = nn.LayerNorm(dim); self.ln2 = nn.LayerNorm(dim)
-        self.mlp = nn.Sequential(nn.Linear(dim, dim*4), nn.GELU(), nn.Linear(dim*4, dim))
-    def forward(self, x):
-        B, N, D = x.shape; res = x; h = self.ln1(x)
-        pm = self.pe(h); st = pm.mean(1)
+        # Peripheral encoder: full dim → sacc_dim
+        self.pe = PeripheralEncoder(base_dim, sacc_dim, bs)
+        # Controller and foveal in sacc_dim space
+        self.ctrl = Controller(sacc_dim, bs)
+        self.fov = Foveal(sacc_dim, nh, ws)
+        # Peripheral map update in sacc_dim space
+        self.ma = nn.MultiheadAttention(sacc_dim, nh, batch_first=True)
+        self.mn = nn.LayerNorm(sacc_dim)
+        self.mg = nn.Sequential(nn.Linear(1, sacc_dim), nn.GELU(), nn.Linear(sacc_dim, 1), nn.Sigmoid())
+        # Output projection
+        self.op = nn.Linear(sacc_dim, sacc_dim); self.on = nn.LayerNorm(sacc_dim)
+        self.ln1 = nn.LayerNorm(sacc_dim); self.ln2 = nn.LayerNorm(sacc_dim)
+        self.mlp = nn.Sequential(nn.Linear(sacc_dim, sacc_dim*4), nn.GELU(), nn.Linear(sacc_dim*4, sacc_dim))
+
+    def forward(self, x_sacc, x_full):
+        """
+        x_sacc: (B, N, sacc_dim=128) — projected tokens for foveal processing
+        x_full: (B, N, base_dim=1536) — full Qwen hidden states for peripheral encoding
+        """
+        B, N, D = x_sacc.shape
+        res = x_sacc
+        h = self.ln1(x_sacc)
+        # Peripheral map from FULL-dim Qwen hidden states
+        pm = self.pe(x_full)  # (B, nb, 128) — rich features projected to sacc_dim
+        st = pm.mean(1)
         fps, fls = [], []; ac = None
         for t in range(self.ns):
             fp, lg, _ = self.ctrl(pm, st); fps.append(fp); fls.append(lg)
+            # Foveal processes projected (128-dim) tokens
             st, ac = self.fov(h, fp, st, ac)
             d, _ = self.ma(self.mn(pm), ac, ac)
-            a = self.mg(torch.tensor([[t/self.ns]], device=x.device, dtype=x.dtype))
+            a = self.mg(torch.tensor([[t/self.ns]], device=x_sacc.device, dtype=x_sacc.dtype))
             pm = pm + a * d
-        x = res + self.op(self.on(st.unsqueeze(1).expand(-1, N, -1)))
-        x = x + self.mlp(self.ln2(x))
-        return x, {'fixation_points': fps, 'fixation_logits': fls}
+        x_sacc = res + self.op(self.on(st.unsqueeze(1).expand(-1, N, -1)))
+        x_sacc = x_sacc + self.mlp(self.ln2(x_sacc))
+        return x_sacc, {'fixation_points': fps, 'fixation_logits': fls}
 
 
 # ── Model ─────────────────────────────────────────────────────────────────────
@@ -194,13 +237,13 @@ class QwenSaccadicPasskey(nn.Module):
         # Freeze ALL Qwen
         for p in self.qwen.parameters(): p.requires_grad = False
 
-        # Bottleneck
+        # Foveal path projection (1536 → 128 for foveal processing)
         self.proj_down = nn.Linear(self.base_dim, SACC_DIM)
         self.proj_up = nn.Linear(SACC_DIM, self.base_dim)
 
-        # 2 saccadic layers
-        self.sacc1 = SaccadicLayer(SACC_DIM, N_HEADS, BLOCK_SIZE, WINDOW_SIZE, NUM_SACCADES)
-        self.sacc2 = SaccadicLayer(SACC_DIM, N_HEADS, BLOCK_SIZE, WINDOW_SIZE, NUM_SACCADES)
+        # 2 saccadic layers (peripheral gets full 1536, foveal gets 128)
+        self.sacc1 = SaccadicLayer(self.base_dim, SACC_DIM, N_HEADS, BLOCK_SIZE, WINDOW_SIZE, NUM_SACCADES)
+        self.sacc2 = SaccadicLayer(self.base_dim, SACC_DIM, N_HEADS, BLOCK_SIZE, WINDOW_SIZE, NUM_SACCADES)
 
         # Classification head
         self.ln_out = nn.LayerNorm(self.base_dim)
@@ -214,9 +257,10 @@ class QwenSaccadicPasskey(nn.Module):
             out = self.qwen(input_ids, output_hidden_states=True)
             hidden = out.hidden_states[-1].float()  # (B, N, 1536)
 
-        h = self.proj_down(hidden)  # (B, N, 128)
-        h, info1 = self.sacc1(h)
-        h, info2 = self.sacc2(h)
+        h = self.proj_down(hidden)  # (B, N, 128) — for foveal path
+        # Peripheral path gets full 1536-dim, foveal path gets 128-dim
+        h, info1 = self.sacc1(h, hidden)
+        h, info2 = self.sacc2(h, hidden)
         h_up = self.proj_up(h)  # (B, N, 1536)
         out_h = self.ln_out(hidden + h_up)
 
