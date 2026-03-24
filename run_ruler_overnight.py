@@ -28,7 +28,7 @@ from ruler_tasks import get_task, get_head_config
 # ── Config ────────────────────────────────────────────────────────────────────
 
 TASKS = ['S-NIAH', 'MK-NIAH', 'VT-2', 'VT-3', 'VT-4']
-CONTEXT_LENGTHS = [4096, 8192, 16384, 32768]
+CONTEXT_LENGTHS = [2048, 4096, 8192, 16384, 32768]  # start at 2048 to validate pipeline
 NUM_TRAIN = 2000
 NUM_VAL = 100
 NUM_EVAL = 200
@@ -37,8 +37,8 @@ LR = 1e-3
 WEIGHT_DECAY = 0.01
 GRAD_CLIP = 1.0
 WARMUP_STEPS = 50
-SUPERVISED_WARMUP_STEPS = 300
-SUPERVISED_WARMUP_WEIGHT = 2.0
+SUPERVISED_WARMUP_STEPS = 500
+SUPERVISED_WARMUP_WEIGHT = 3.0
 TEMP_ANNEAL_STEPS = 800  # soft routing temperature annealing
 MAX_TIME = 1800  # 30 min per config
 PATIENCE = 2000  # match debug script — model needs ~600 steps before first improvement

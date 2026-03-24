@@ -22,7 +22,7 @@ from transformers import AutoModelForCausalLM
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-TOP_K = 16  # blocks to process per saccade during training
+TOP_K_RATIO = 0.1  # process 10% of blocks per saccade (min 8, max 32)
 
 # ── Saccadic Components ───────────────────────────────────────────────────────
 
@@ -73,8 +73,10 @@ class SaccadicController(nn.Module):
         logits = scores
 
         if self.training:
+            n_blocks = scores.shape[1]
+            top_k = max(8, min(32, int(n_blocks * TOP_K_RATIO)))
             topk_vals, topk_idx = torch.topk(
-                scores, k=min(TOP_K, scores.shape[1]), dim=-1)
+                scores, k=min(top_k, n_blocks), dim=-1)
             topk_weights = F.softmax(topk_vals / self.temperature, dim=-1)
             best_fp = (topk_idx[:, 0] * self.block_size).long()
         else:
