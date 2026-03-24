@@ -268,8 +268,9 @@ class SaccadicLayer(nn.Module):
 # ── Model ─────────────────────────────────────────────────────────────────────
 
 class QwenSaccadicPasskey(nn.Module):
-    def __init__(self):
+    def __init__(self, n_digits=5, num_saccades=None):
         super().__init__()
+        ns = num_saccades or NUM_SACCADES
         self.qwen = AutoModelForCausalLM.from_pretrained(
             MODEL_NAME, dtype=torch.float16, trust_remote_code=True)
         self.base_dim = self.qwen.config.hidden_size  # 1536
@@ -283,12 +284,13 @@ class QwenSaccadicPasskey(nn.Module):
         self.proj_up = nn.Linear(SACC_DIM, self.base_dim)
 
         # 2 saccadic layers (peripheral gets full 1536, foveal gets 128)
-        self.sacc1 = SaccadicLayer(self.base_dim, SACC_DIM, N_HEADS, BLOCK_SIZE, WINDOW_SIZE, NUM_SACCADES)
-        self.sacc2 = SaccadicLayer(self.base_dim, SACC_DIM, N_HEADS, BLOCK_SIZE, WINDOW_SIZE, NUM_SACCADES)
+        self.sacc1 = SaccadicLayer(self.base_dim, SACC_DIM, N_HEADS, BLOCK_SIZE, WINDOW_SIZE, ns)
+        self.sacc2 = SaccadicLayer(self.base_dim, SACC_DIM, N_HEADS, BLOCK_SIZE, WINDOW_SIZE, ns)
 
-        # Classification head
+        # Classification head — configurable number of digits
         self.ln_out = nn.LayerNorm(self.base_dim)
-        self.digit_heads = nn.ModuleList([nn.Linear(self.base_dim, 10) for _ in range(5)])
+        self.n_digits = n_digits
+        self.digit_heads = nn.ModuleList([nn.Linear(self.base_dim, 10) for _ in range(n_digits)])
 
         self._tp = sum(p.numel() for p in self.parameters() if p.requires_grad)
 
@@ -307,7 +309,7 @@ class QwenSaccadicPasskey(nn.Module):
 
         last = out_h[:, -1, :]  # (B, 1536)
         dl = [head(last) for head in self.digit_heads]
-        loss = sum(F.cross_entropy(dl[i], labels[:, i]) for i in range(5)) / 5 if labels is not None else None
+        loss = sum(F.cross_entropy(dl[i], labels[:, i]) for i in range(self.n_digits)) / self.n_digits if labels is not None else None
         return {'loss': loss, 'digit_logits': dl, 'fixation_info': {0: info1, 1: info2}}
 
     def set_gumbel_temperature(self, t):

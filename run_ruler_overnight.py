@@ -22,8 +22,8 @@ from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from saccadic_qwen import SaccadicQwen
-from ruler_tasks import get_task, get_head_config
+from debug_qwen_passkey import QwenSaccadicPasskey, routing_temp as _routing_temp
+from ruler_tasks import get_task
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -394,22 +394,17 @@ def main():
             val_data = task.generate(ctx_len, NUM_VAL, seed=77777)
             test_data = task.generate(ctx_len, NUM_EVAL, seed=99999)
 
-            # Get task head config
-            head_cls, head_kwargs, num_saccades = get_head_config(task_name)
+            # Determine task config
+            task_configs = {
+                'S-NIAH': (7, 3), 'MK-NIAH': (7, 3),
+                'VT-2': (4, 2), 'VT-3': (4, 3), 'VT-4': (4, 4),
+            }
+            n_digits, num_saccades = task_configs[task_name]
 
-            # Build saccadic model
-            log(f'Building SaccadicQwen (num_saccades={num_saccades})...')
-            task_head = head_cls(**head_kwargs)
-            model = SaccadicQwen(
-                model_name=MODEL_NAME,
-                saccadic_dim=128,
-                block_size=BLOCK_SIZE,
-                window_size=64,
-                num_saccades=num_saccades,
-                n_heads=4,
-                task_head=task_head,
-            ).to(device)
-            log(f'Trainable params: {model.trainable_params():,}')
+            # Build saccadic model (using PROVEN debug model)
+            log(f'Building QwenSaccadicPasskey (n_digits={n_digits}, num_saccades={num_saccades})...')
+            model = QwenSaccadicPasskey(n_digits=n_digits, num_saccades=num_saccades).to(device)
+            log(f'Trainable params: {model._tp:,}')
 
             # Train saccadic model
             log('Training saccadic model...')
