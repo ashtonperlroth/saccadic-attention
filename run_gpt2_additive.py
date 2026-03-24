@@ -147,7 +147,7 @@ class Foveal(nn.Module):
         return cl,(torch.cat([acc,win],1) if acc is not None else win)
 
 class SaccadicLayer(nn.Module):
-    """Standalone saccadic layer (not replacing a GPT-2 block)."""
+    """Standalone saccadic layer operating in SACC_DIM space."""
     def __init__(self, dim, nh, n_saccades):
         super().__init__()
         self.n_saccades = n_saccades
@@ -175,30 +175,33 @@ class SaccadicLayer(nn.Module):
         return x, {'fixation_points':fps,'fixation_logits':fls}
 
 
+
 # ── Additive Model ───────────────────────────────────────────────────────────
 
 class GPT2Additive(nn.Module):
-    """Frozen GPT-2 (all 12 layers) + 2 new saccadic layers on top."""
+    """Frozen GPT-2 (12 layers) → project 768→128 → 2 saccadic layers (128-dim) → project 128→768."""
     def __init__(self, n_hops, n_saccades):
         super().__init__()
         self.n_hops = n_hops
         self.gpt2 = GPT2LMHeadModel.from_pretrained('gpt2')
         self.max_pos = self.gpt2.config.n_positions
-        dim = self.gpt2.config.n_embd  # 768
 
         # Freeze ALL GPT-2 params
         for p in self.gpt2.parameters(): p.requires_grad = False
 
-        # 2 new saccadic layers on top (ALL trainable)
-        self.sacc1 = SaccadicLayer(dim, N_HEADS, n_saccades)
-        self.sacc2 = SaccadicLayer(dim, N_HEADS, n_saccades)
+        # Bottleneck projections (trainable)
+        self.proj_down = nn.Linear(GPT2_DIM, SACC_DIM)  # 768 → 128
+        self.proj_up = nn.Linear(SACC_DIM, GPT2_DIM)    # 128 → 768
 
-        # Classification head
-        self.ln_out = nn.LayerNorm(dim)
-        self.digit_heads = nn.ModuleList([nn.Linear(dim, 10) for _ in range(n_hops)])
+        # 2 saccadic layers in 128-dim space (trainable)
+        self.sacc1 = SaccadicLayer(SACC_DIM, N_HEADS, n_saccades)
+        self.sacc2 = SaccadicLayer(SACC_DIM, N_HEADS, n_saccades)
 
-        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        self._tp = trainable
+        # Classification head from 768-dim (after proj_up + residual)
+        self.ln_out = nn.LayerNorm(GPT2_DIM)
+        self.digit_heads = nn.ModuleList([nn.Linear(GPT2_DIM, 10) for _ in range(n_hops)])
+
+        self._tp = sum(p.numel() for p in self.parameters() if p.requires_grad)
 
     def forward(self, ids, labels=None):
         B, N = ids.shape; dev = ids.device
@@ -208,15 +211,20 @@ class GPT2Additive(nn.Module):
         cp = torch.arange(N, device=dev)
         for blk in self.gpt2.transformer.h:
             x = blk(x, cache_position=cp)
-        x = self.gpt2.transformer.ln_f(x)
-        # x is now GPT-2's final output: (B, N, 768) — rich contextualized representations
+        x_gpt2 = self.gpt2.transformer.ln_f(x)  # (B, N, 768)
 
-        # Pass through 2 saccadic layers
-        x, info1 = self.sacc1(x)
-        x, info2 = self.sacc2(x)
+        # Project down to 128-dim
+        x_small = self.proj_down(x_gpt2)  # (B, N, 128)
+
+        # 2 saccadic layers in compressed space
+        x_small, info1 = self.sacc1(x_small)
+        x_small, info2 = self.sacc2(x_small)
+
+        # Project back up and residual with GPT-2 output
+        x_out = x_gpt2 + self.proj_up(x_small)  # (B, N, 768)
 
         # Classify
-        last = self.ln_out(x[:, -1])
+        last = self.ln_out(x_out[:, -1])
         dl = [h(last) for h in self.digit_heads]
         loss = sum(F.cross_entropy(dl[i], labels[:,i]) for i in range(self.n_hops))/self.n_hops if labels is not None else None
         return {'loss': loss, 'digit_logits': dl, 'fixation_info': {0: info1, 1: info2}}

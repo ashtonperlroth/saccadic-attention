@@ -1,26 +1,52 @@
 [
   {
-    "n_hops": 3, "n_saccades": 3,
-    "accuracy": 0.37, "avg_clue_distance": 152.95,
-    "steps": 3100, "time_s": 569.0,
+    "n_hops": 3,
+    "n_saccades": 3,
+    "accuracy": 0.415,
+    "avg_clue_distance": 185.96166666666667,
+    "steps": 2950,
+    "time_s": 486.6,
     "converge_reason": "plateau (500 steps)",
-    "architecture": "additive",
-    "trainable_params": 60641314
+    "architecture": "additive"
   },
   {
-    "n_hops": 3, "n_saccades": 4,
-    "accuracy": 0.015, "avg_clue_distance": 215.66,
-    "steps": 650, "time_s": 127.0,
+    "n_hops": 3,
+    "n_saccades": 4,
+    "accuracy": 0.48,
+    "avg_clue_distance": 319.43625,
+    "steps": 3150,
+    "time_s": 561.8,
     "converge_reason": "plateau (500 steps)",
-    "architecture": "additive",
-    "trainable_params": 60641314
+    "architecture": "additive"
   },
   {
-    "n_hops": 4, "n_saccades": 4,
-    "accuracy": 0.0, "avg_clue_distance": 128.36,
-    "steps": 800, "time_s": 156.0,
+    "n_hops": 4,
+    "n_saccades": 4,
+    "accuracy": 0.025,
+    "avg_clue_distance": 144.509375,
+    "steps": 950,
+    "time_s": 169.3,
     "converge_reason": "plateau (500 steps)",
-    "architecture": "additive",
-    "trainable_params": 60649004
+    "architecture": "additive"
+  },
+  {
+    "n_hops": 4,
+    "n_saccades": 5,
+    "accuracy": 0.035,
+    "avg_clue_distance": 184.6865,
+    "steps": 1750,
+    "time_s": 335.3,
+    "converge_reason": "plateau (500 steps)",
+    "architecture": "additive"
+  },
+  {
+    "n_hops": 5,
+    "n_saccades": 5,
+    "accuracy": 0.0,
+    "avg_clue_distance": 87.867,
+    "steps": 500,
+    "time_s": 95.3,
+    "converge_reason": "plateau (500 steps)",
+    "architecture": "additive"
   }
 ]
