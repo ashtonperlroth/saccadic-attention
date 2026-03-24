@@ -47,7 +47,8 @@ ENTROPY_BONUS = 0.01
 BLOCK_SIZE = 8
 
 RESULTS_FILE = 'ruler_results.json'
-MODEL_NAME = 'Qwen/Qwen2.5-1.5B'
+MODEL_NAME = 'Qwen/Qwen2.5-1.5B'            # base model for saccadic (frozen backbone)
+INSTRUCT_MODEL = 'Qwen/Qwen2.5-1.5B-Instruct'  # instruct model for baseline eval
 
 def log(msg):
     print(msg, file=sys.stderr, flush=True)
@@ -287,29 +288,51 @@ def evaluate_saccadic(model, test_data, task_name, device):
     return acc, dist
 
 
-def evaluate_baseline(test_data, task_name, device, tokenizer):
-    """Evaluate vanilla Qwen (no saccadic). Few-shot prompting."""
-    # For baseline: we just check if Qwen can solve the task with standard attention
-    # Load Qwen for generation
+def evaluate_baseline(test_data, task_name, ctx_len, device, base_tokenizer):
+    """Evaluate Qwen-Instruct with chat template. Substring match for accuracy."""
+    instruct_tok = AutoTokenizer.from_pretrained(INSTRUCT_MODEL, trust_remote_code=True)
     qwen = AutoModelForCausalLM.from_pretrained(
-        MODEL_NAME, dtype=torch.float16, trust_remote_code=True).to(device)
+        INSTRUCT_MODEL, dtype=torch.float16, trust_remote_code=True).to(device)
     qwen.eval()
 
     correct = total = 0
+    n_eval = min(50, len(test_data))  # cap baseline eval (generation is slow)
     with torch.no_grad():
-        for sample in test_data[:50]:  # Limit baseline eval (slow generation)
-            ids = sample['input_ids'].unsqueeze(0).to(device)
-            # Try to generate answer tokens
+        for sample in test_data[:n_eval]:
+            # Decode the raw input_ids back to text (using base tokenizer)
+            raw_text = base_tokenizer.decode(sample['input_ids'].tolist(), skip_special_tokens=True)
+
+            # Format as chat with explicit instruction
+            if task_name == 'CWE':
+                instruction = "List the 5 most common words in the text above, separated by commas. Reply with ONLY the words."
+            elif 'VT' in task_name:
+                instruction = "Follow the variable assignments in the text and answer the question. Reply with ONLY the final numeric value."
+            elif 'MV' in task_name:
+                instruction = "Find ALL matching numbers in the text and list them. Reply with ONLY the numbers separated by commas."
+            else:
+                instruction = "Answer the question at the end of the text. Reply with ONLY the number, nothing else."
+
+            messages = [{"role": "user", "content": raw_text + "\n\n" + instruction}]
+            prompt = instruct_tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+
             try:
-                gen = qwen.generate(ids, max_new_tokens=20, do_sample=False,
-                                    pad_token_id=tokenizer.eos_token_id)
-                gen_text = tokenizer.decode(gen[0, ids.shape[1]:], skip_special_tokens=True).strip()
-            except Exception:
+                ids = instruct_tok.encode(prompt, return_tensors="pt").to(device)
+                # Skip if too long for GPU memory
+                if ids.shape[1] > ctx_len + 500:
+                    ids = ids[:, -(ctx_len + 500):]  # keep end (where query is)
+                gen = qwen.generate(ids, max_new_tokens=50, do_sample=False,
+                                    pad_token_id=instruct_tok.eos_token_id)
+                gen_text = instruct_tok.decode(gen[0, ids.shape[1]:], skip_special_tokens=True).strip()
+            except torch.cuda.OutOfMemoryError:
+                log(f'  Baseline OOM at ctx_len={ctx_len}, skipping remaining')
+                torch.cuda.empty_cache()
+                break
+            except Exception as e:
                 gen_text = ''
+                log(f'  Baseline error: {e}')
 
             ans = sample['answer']
             if isinstance(ans, list):
-                # Multi-value: check if all values appear
                 if all(str(a) in gen_text for a in ans):
                     correct += 1
             else:
@@ -401,10 +424,10 @@ def main():
             del model
             torch.cuda.empty_cache()
 
-            # Evaluate baseline Qwen
-            log('Evaluating baseline Qwen...')
+            # Evaluate baseline Qwen (Instruct model with chat template)
+            log('Evaluating baseline Qwen-Instruct...')
             try:
-                baseline_acc = evaluate_baseline(test_data, task_name, device, tokenizer)
+                baseline_acc = evaluate_baseline(test_data, task_name, ctx_len, device, tokenizer)
                 log(f'Baseline: accuracy={baseline_acc:.4f}')
             except Exception as e:
                 log(f'Baseline failed: {e}')
